@@ -11,15 +11,21 @@ login is actually in progress or an active Microsoft 365 session cookie is prese
 - Adds a "Sign in with Microsoft 365" button above the normal login form.
 - On click, redirects to Microsoft's login page (`login.microsoftonline.com`) with PKCE.
 - On return, exchanges the authorization code for an ID token, verifies its signature against
-  Microsoft's published signing keys (JWKS) and its `iss`/`aud`/`exp`/`nbf` claims, then checks
+  Microsoft's published signing keys (JWKS) and its `iss`/`tid`/`aud`/`nonce`/`exp`/`iat`/`nbf` claims, then checks
   the signed-in account's Entra ID **group membership** against an allow-list before granting
   access.
 - On success, sets its own signed session cookie (HMAC'd with a key derived from
-  `YOURLS_COOKIEKEY`) and logs the user in as their email address.
+  `YOURLS_COOKIEKEY`) and logs the user in as their email address. The cookie is bound to the
+  active Entra tenant, client ID, and client secret; changing any of them ends existing SSO sessions.
 - No new user database or external service is required beyond Azure AD itself.
 
 **Fails closed**: if no allowed group is configured, no Microsoft 365 account can log in, even
 if the app registration is otherwise valid.
+
+SSO requires a unique, random `YOURLS_COOKIEKEY` of at least 32 characters. The sample key and
+the public documentation example are rejected. Configure `YOURLS_SITE` with an HTTPS URL so the
+browser uses secure, host-only SSO cookies. SSO is disabled on plain HTTP sites except localhost.
+Set `YOURLS_PRIVATE` to `true`; YOURLS does not require authentication when the site is public.
 
 ## 1. Register an application in Azure
 
@@ -65,10 +71,11 @@ if the app registration is otherwise valid.
 - **Overage limit**: if an account belongs to a very large number of groups tenant-wide
   (roughly 200+), Microsoft omits the `groups` claim from the token entirely for that sign-in.
   The plugin treats this as "no group information available" and rejects the sign-in (fails
-  closed). If this matters for your tenant, prefer a small dedicated group (e.g. "YOURLS
-  Admins") over a huge one.
+  closed). The limit is based on the user's total group memberships, not the size of the
+  allowed group. If this matters, configure Entra to emit only groups assigned to this
+  application, or add a Microsoft Graph lookup before granting access.
 - Group membership is captured at sign-in time and cached in the session cookie for its
-  lifetime (default 30 days). Removing someone from the group in Entra ID takes effect the next
+  lifetime (YOURLS defaults to 7 days). Removing someone from the group in Entra ID takes effect the next
   time they sign in again (i.e. once their current session cookie expires or they log out) —
   not instantly on their next click.
 
@@ -92,7 +99,7 @@ Temporarily set `define( 'YOURLS_DEBUG', true );` in `user/config.php` and try s
 off (`false`) once you're done, it shouldn't stay on in production.
 
 - **"this account is not authorized for this site"**, and the debug log shows
-  `rejected account not on allow-list: someone@example.com` — that identity either isn't a
+  `rejected account not on allow-list: "someone@example.com"` — that identity either isn't a
   member of any allowed group, or (see next point) the token isn't carrying group information
   at all yet.
 - **Same rejection even though the account is a member of an allowed group**, and the debug log
@@ -101,7 +108,8 @@ off (`false`) once you're done, it shouldn't stay on in production.
   or only the **Access** token column was checked instead of **ID**. Fix it in Azure, then sign
   in again (existing sessions/cached tokens won't retroactively gain the claim).
 - **The debug log mentions "overage"** — the account belongs to too many groups tenant-wide for
-  Microsoft to list them in the token (roughly 200+). Use a smaller, dedicated group instead.
+  Microsoft to list them in the token (roughly 200+). Limit the emitted groups to those assigned
+  to this application, or add a Graph lookup.
 - **"your login attempt expired"** right after coming back from Microsoft — the state cookie set
   before redirecting to Microsoft didn't come back with the browser. Usually caused by taking
   more than 10 minutes to complete sign-in (MFA prompts, etc.), or by `YOURLS_SITE` in
@@ -116,3 +124,6 @@ off (`false`) once you're done, it shouldn't stay on in production.
 - API access (`yourls-api.php` with a signature/timestamp or username/password) is untouched by
   this plugin and keeps working as before.
 - Logging out clears both the normal YOURLS cookie and this plugin's session cookie.
+- Local username/password and API authentication remain available through YOURLS core. If Entra
+  must be the only way to access the admin area, additional YOURLS or web-server controls are
+  required; this plugin does not enforce SSO-only access.

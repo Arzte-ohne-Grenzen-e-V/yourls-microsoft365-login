@@ -10,8 +10,11 @@ Author URI: https://skolskyit.guru
 // No direct call
 if( !defined( 'YOURLS_ABSPATH' ) ) die();
 
-if( !defined( 'YOURLS_M365_SESSION_COOKIE' ) ) define( 'YOURLS_M365_SESSION_COOKIE', 'yourls_m365_session' );
-if( !defined( 'YOURLS_M365_STATE_COOKIE' ) )   define( 'YOURLS_M365_STATE_COOKIE', 'yourls_m365_state' );
+// The __Host- prefix prevents a sibling subdomain from planting a login cookie.
+$yourls_m365_cookie_prefix = parse_url( yourls_get_yourls_site(), PHP_URL_SCHEME ) === 'https' ? '__Host-' : '';
+$yourls_m365_cookie_suffix = substr( hash( 'sha256', yourls_get_yourls_site() ), 0, 12 );
+if( !defined( 'YOURLS_M365_SESSION_COOKIE' ) ) define( 'YOURLS_M365_SESSION_COOKIE', $yourls_m365_cookie_prefix . 'yourls_m365_session_' . $yourls_m365_cookie_suffix );
+if( !defined( 'YOURLS_M365_STATE_COOKIE' ) )   define( 'YOURLS_M365_STATE_COOKIE', $yourls_m365_cookie_prefix . 'yourls_m365_state_' . $yourls_m365_cookie_suffix );
 
 /**
  * Map of setting keys to optional PHP constants that, if defined in config.php, take precedence
@@ -52,7 +55,7 @@ function yourls_m365_list_setting( $key ) {
  * membership couldn't be evaluated (see the settings page for details), nobody is allowed in.
  *
  * @param string $email   The account's email / preferred_username, lower-cased. Only used for
- *                         identification (becomes the YOURLS username) and for filters/logging.
+ *                         identification (becomes the YOURLS username) and logging.
  * @param array  $groups  Entra ID group Object IDs (GUIDs) the account belongs to, from the
  *                         ID token's "groups" claim (empty if group claims aren't enabled, or
  *                         if the account is in too many groups for Microsoft to list them all
@@ -73,7 +76,7 @@ function yourls_m365_is_allowed( $email, $groups = array() ) {
         }
     }
 
-    return yourls_apply_filter( 'm365_is_allowed', false, $email, $groups );
+    return false;
 }
 
 /*
@@ -87,8 +90,33 @@ function yourls_m365_authority() {
 function yourls_m365_authorize_endpoint() { return yourls_m365_authority() . '/oauth2/v2.0/authorize'; }
 function yourls_m365_token_endpoint()     { return yourls_m365_authority() . '/oauth2/v2.0/token'; }
 function yourls_m365_jwks_endpoint()      { return yourls_m365_authority() . '/discovery/v2.0/keys'; }
-function yourls_m365_issuer()             { return yourls_m365_authority() . '/v2.0'; }
 function yourls_m365_redirect_uri()       { return yourls_admin_url( 'index.php' ); }
+
+function yourls_m365_issuer() {
+    $tenant = (string) yourls_m365_get_setting( 'tenant_id' );
+    if( $tenant === '' || in_array( strtolower( $tenant ), array( 'common', 'organizations', 'consumers' ), true ) ) {
+        return false;
+    }
+
+    $cache = yourls_get_option( 'm365_issuer_cache' );
+    if( is_array( $cache ) && ( $cache['tenant'] ?? null ) === $tenant
+        && is_string( $cache['issuer'] ?? null ) && ( $cache['fetched'] ?? 0 ) > time() - 43200 ) {
+        return $cache['issuer'];
+    }
+
+    $body = yourls_http_get_body( yourls_m365_authority() . '/v2.0/.well-known/openid-configuration' );
+    $metadata = is_string( $body ) ? json_decode( $body, true ) : null;
+    $issuer = is_array( $metadata ) ? ( $metadata['issuer'] ?? '' ) : '';
+    if( !is_string( $issuer ) || !preg_match( '~^https://login\.microsoftonline\.com/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/v2\.0$~i', $issuer, $matches ) ) {
+        return false;
+    }
+    if( preg_match( '/^[0-9a-f-]{36}$/i', $tenant ) && strcasecmp( $matches[1], $tenant ) !== 0 ) {
+        return false;
+    }
+
+    yourls_update_option( 'm365_issuer_cache', array( 'tenant' => $tenant, 'fetched' => time(), 'issuer' => $issuer ) );
+    return $issuer;
+}
 
 /*
  * Base64url and signed-cookie helpers (used for the transient "state/PKCE" cookie and the
@@ -109,27 +137,29 @@ function yourls_m365_b64url_decode( $data ) {
 }
 
 function yourls_m365_cookie_secret() {
-    $base = defined( 'YOURLS_COOKIEKEY' ) ? YOURLS_COOKIEKEY : md5( __FILE__ );
-    return hash_hmac( 'sha256', 'yourls-microsoft365-login', $base );
-}
-
-function yourls_m365_cookie_domain() {
-    $domain = parse_url( yourls_get_yourls_site(), PHP_URL_HOST );
-    return ( $domain === 'localhost' ) ? '' : $domain;
+    if( !defined( 'YOURLS_COOKIEKEY' ) || !is_string( YOURLS_COOKIEKEY ) || strlen( YOURLS_COOKIEKEY ) < 32 || in_array( YOURLS_COOKIEKEY, array( 'modify this text with something random', 'qQ4KhL_pu|s@Zm7n#%:b^{A[vhm' ), true ) ) {
+        return false;
+    }
+    return hash_hmac( 'sha256', 'yourls-microsoft365-login:' . yourls_get_yourls_site(), YOURLS_COOKIEKEY );
 }
 
 function yourls_m365_set_signed_cookie( $name, array $payload, $ttl ) {
+    $secret = yourls_m365_cookie_secret();
+    if( $secret === false ) {
+        return false;
+    }
     $encoded   = yourls_m365_b64url_encode( json_encode( $payload ) );
-    $signature = hash_hmac( 'sha256', $encoded, yourls_m365_cookie_secret() );
-    yourls_setcookie( $name, $encoded . '.' . $signature, time() + $ttl, '/', yourls_m365_cookie_domain(), yourls_is_ssl(), true );
+    $signature = hash_hmac( 'sha256', $encoded, $secret );
+    return yourls_setcookie( $name, $encoded . '.' . $signature, time() + $ttl, '/', '', parse_url( yourls_get_yourls_site(), PHP_URL_SCHEME ) === 'https', true );
 }
 
 function yourls_m365_read_signed_cookie( $value ) {
-    if( !is_string( $value ) || strpos( $value, '.' ) === false ) {
+    $secret = yourls_m365_cookie_secret();
+    if( $secret === false || !is_string( $value ) || strpos( $value, '.' ) === false ) {
         return false;
     }
     list( $encoded, $signature ) = explode( '.', $value, 2 );
-    if( !hash_equals( hash_hmac( 'sha256', $encoded, yourls_m365_cookie_secret() ), $signature ) ) {
+    if( !hash_equals( hash_hmac( 'sha256', $encoded, $secret ), $signature ) ) {
         return false;
     }
     $payload = json_decode( yourls_m365_b64url_decode( $encoded ), true );
@@ -137,7 +167,26 @@ function yourls_m365_read_signed_cookie( $value ) {
 }
 
 function yourls_m365_clear_cookie( $name ) {
-    yourls_setcookie( $name, '', time() - 3600, '/', yourls_m365_cookie_domain(), yourls_is_ssl(), true );
+    yourls_setcookie( $name, '', time() - 3600, '/', '', parse_url( yourls_get_yourls_site(), PHP_URL_SCHEME ) === 'https', true );
+}
+
+function yourls_m365_config_fingerprint() {
+    $secret = yourls_m365_cookie_secret();
+    if( $secret === false ) {
+        return false;
+    }
+    return hash_hmac( 'sha256', json_encode( array(
+        yourls_m365_get_setting( 'tenant_id' ),
+        yourls_m365_get_setting( 'client_id' ),
+        yourls_m365_get_setting( 'client_secret' ),
+    ) ), $secret );
+}
+
+function yourls_m365_secure_site() {
+    $site = yourls_get_yourls_site();
+    $scheme = parse_url( $site, PHP_URL_SCHEME );
+    $host = parse_url( $site, PHP_URL_HOST );
+    return $scheme === 'https' || ( $scheme === 'http' && in_array( $host, array( 'localhost', '127.0.0.1', '::1' ), true ) );
 }
 
 /*
@@ -146,7 +195,9 @@ function yourls_m365_clear_cookie( $name ) {
 
 function yourls_m365_get_jwks() {
     $cache = yourls_get_option( 'm365_jwks_cache' );
-    $fresh = is_array( $cache ) && !empty( $cache['keys'] ) && ( time() - (int)($cache['fetched'] ?? 0) ) < 43200;
+    $tenant = (string) yourls_m365_get_setting( 'tenant_id' );
+    $same_tenant = is_array( $cache ) && ( $cache['tenant'] ?? null ) === $tenant;
+    $fresh = $same_tenant && !empty( $cache['keys'] ) && ( time() - (int)($cache['fetched'] ?? 0) ) < 43200;
     if( $fresh ) {
         return $cache['keys'];
     }
@@ -154,18 +205,23 @@ function yourls_m365_get_jwks() {
     $body = yourls_http_get_body( yourls_m365_jwks_endpoint() );
     $data = $body ? json_decode( $body, true ) : null;
 
-    if( empty( $data['keys'] ) ) {
-        // Fetch failed: fall back to a stale cache rather than hard-failing every login
-        return is_array( $cache ) ? ( $cache['keys'] ?? array() ) : array();
+    if( !is_array( $data['keys'] ?? null ) || !$data['keys'] ) {
+        // A short outage may use a recent, same-tenant cache; revoked keys cannot live forever.
+        return $same_tenant && ( time() - (int)($cache['fetched'] ?? 0) ) < 86400
+            ? ( $cache['keys'] ?? array() ) : array();
     }
 
-    yourls_update_option( 'm365_jwks_cache', array( 'fetched' => time(), 'keys' => $data['keys'] ) );
+    yourls_update_option( 'm365_jwks_cache', array( 'tenant' => $tenant, 'fetched' => time(), 'keys' => $data['keys'] ) );
     return $data['keys'];
 }
 
-function yourls_m365_find_public_key( $kid ) {
+function yourls_m365_find_public_key( $kid, $issuer ) {
     foreach( yourls_m365_get_jwks() as $key ) {
         if( ( $key['kid'] ?? '' ) === $kid && !empty( $key['x5c'][0] ) ) {
+            $key_issuer = $key['issuer'] ?? '';
+            if( $key_issuer !== '' && $key_issuer !== $issuer && str_replace( '{tenantid}', basename( dirname( $issuer ) ), $key_issuer ) !== $issuer ) {
+                continue;
+            }
             $pem = "-----BEGIN CERTIFICATE-----\n" . chunk_split( $key['x5c'][0], 64, "\n" ) . "-----END CERTIFICATE-----\n";
             $resource = openssl_pkey_get_public( $pem );
             if( $resource !== false ) {
@@ -178,10 +234,13 @@ function yourls_m365_find_public_key( $kid ) {
 
 /**
  * Verify an ID token's signature (RS256, against Microsoft's published JWKS) and its
- * standard claims (issuer, audience, expiry, not-before). Returns the decoded claims on
+ * standard claims (issuer, tenant, audience, nonce, expiry, issued-at, not-before). Returns the decoded claims on
  * success, false otherwise.
  */
-function yourls_m365_verify_id_token( $id_token, $client_id, $issuer ) {
+function yourls_m365_verify_id_token( $id_token, $client_id, $issuer, $nonce ) {
+    if( !$issuer || !$nonce ) {
+        return false;
+    }
     $parts = explode( '.', (string) $id_token );
     if( count( $parts ) !== 3 ) {
         return false;
@@ -199,7 +258,7 @@ function yourls_m365_verify_id_token( $id_token, $client_id, $issuer ) {
         return false;
     }
 
-    $public_key = yourls_m365_find_public_key( $header['kid'] );
+    $public_key = yourls_m365_find_public_key( $header['kid'], $issuer );
     if( !$public_key ) {
         return false;
     }
@@ -214,12 +273,27 @@ function yourls_m365_verify_id_token( $id_token, $client_id, $issuer ) {
     if( ( $payload['aud'] ?? '' ) !== $client_id ) {
         return false;
     }
-
-    $now = time();
-    if( empty( $payload['exp'] ) || $now > ( (int) $payload['exp'] + 60 ) ) {
+    if( !is_string( $payload['nonce'] ?? null ) || !hash_equals( $nonce, $payload['nonce'] ) ) {
         return false;
     }
-    if( !empty( $payload['nbf'] ) && $now < ( (int) $payload['nbf'] - 60 ) ) {
+    if( !is_string( $payload['tid'] ?? null ) || $issuer !== 'https://login.microsoftonline.com/' . $payload['tid'] . '/v2.0' ) {
+        return false;
+    }
+    if( !is_string( $payload['sub'] ?? null ) || $payload['sub'] === '' ) {
+        return false;
+    }
+
+    $now = time();
+    if( !is_numeric( $payload['exp'] ?? null ) || $now > ( (int) $payload['exp'] + 60 ) ) {
+        return false;
+    }
+    if( !is_numeric( $payload['iat'] ?? null ) || (int) $payload['iat'] > $now + 60 ) {
+        return false;
+    }
+    if( isset( $payload['nbf'] ) && ( !is_numeric( $payload['nbf'] ) || $now < ( (int) $payload['nbf'] - 60 ) ) ) {
+        return false;
+    }
+    if( (int) $payload['iat'] > (int) $payload['exp'] ) {
         return false;
     }
 
@@ -262,7 +336,10 @@ function yourls_m365_shunt_is_valid_user( $pre ) {
         $session = yourls_m365_read_signed_cookie( $_COOKIE[ YOURLS_M365_SESSION_COOKIE ] );
         $email   = is_array( $session ) ? ( $session['email'] ?? '' ) : '';
         $groups  = ( is_array( $session ) && is_array( $session['groups'] ?? null ) ) ? $session['groups'] : array();
-        $valid   = $session && !empty( $session['exp'] ) && $session['exp'] > time() && yourls_m365_is_allowed( $email, $groups );
+        $valid   = yourls_m365_secure_site() && $session && !empty( $session['exp'] ) && $session['exp'] > time()
+            && is_string( $session['cfg'] ?? null )
+            && hash_equals( yourls_m365_config_fingerprint(), $session['cfg'] )
+            && yourls_m365_is_allowed( $email, $groups );
 
         if( $valid ) {
             yourls_set_user( $email );
@@ -279,19 +356,25 @@ function yourls_m365_shunt_is_valid_user( $pre ) {
 function yourls_m365_start_login() {
     $client_id = yourls_m365_get_setting( 'client_id' );
     $tenant_id = yourls_m365_get_setting( 'tenant_id' );
-    if( !$client_id || !$tenant_id ) {
+    if( !yourls_m365_secure_site() || !$client_id || !$tenant_id || !yourls_m365_get_setting( 'client_secret' )
+        || yourls_m365_cookie_secret() === false || !yourls_m365_issuer() ) {
         return; // not configured: fall through to the regular login form
     }
 
     $verifier  = bin2hex( random_bytes( 32 ) );
     $challenge = yourls_m365_b64url_encode( hash( 'sha256', $verifier, true ) );
     $state     = bin2hex( random_bytes( 16 ) );
+    $nonce     = bin2hex( random_bytes( 16 ) );
 
-    yourls_m365_set_signed_cookie( YOURLS_M365_STATE_COOKIE, array(
+    if( !yourls_m365_set_signed_cookie( YOURLS_M365_STATE_COOKIE, array(
         's'   => $state,
         'v'   => $verifier,
+        'n'   => $nonce,
+        'cfg' => yourls_m365_config_fingerprint(),
         'exp' => time() + 600,
-    ), 600 );
+    ), 600 ) ) {
+        return;
+    }
 
     $params = array(
         'client_id'             => $client_id,
@@ -300,6 +383,7 @@ function yourls_m365_start_login() {
         'response_mode'         => 'query',
         'scope'                 => 'openid profile email',
         'state'                 => $state,
+        'nonce'                 => $nonce,
         'code_challenge'        => $challenge,
         'code_challenge_method' => 'S256',
         'prompt'                => 'select_account',
@@ -314,7 +398,7 @@ function yourls_m365_handle_callback() {
     $client_secret = yourls_m365_get_setting( 'client_secret' );
     $tenant_id     = yourls_m365_get_setting( 'tenant_id' );
 
-    if( !$client_id || !$client_secret || !$tenant_id ) {
+    if( !yourls_m365_secure_site() || !$client_id || !$client_secret || !$tenant_id || yourls_m365_cookie_secret() === false ) {
         return yourls__( 'Microsoft 365 login is not configured.' );
     }
 
@@ -325,7 +409,10 @@ function yourls_m365_handle_callback() {
     $stored = yourls_m365_read_signed_cookie( $_COOKIE[ YOURLS_M365_STATE_COOKIE ] );
     yourls_m365_clear_cookie( YOURLS_M365_STATE_COOKIE );
 
-    if( !$stored || empty( $stored['exp'] ) || $stored['exp'] < time() ) {
+    if( !$stored || empty( $stored['exp'] ) || $stored['exp'] < time()
+        || !is_string( $stored['s'] ?? null ) || !is_string( $stored['v'] ?? null )
+        || !is_string( $stored['n'] ?? null ) || !is_string( $stored['cfg'] ?? null )
+        || !hash_equals( yourls_m365_config_fingerprint(), $stored['cfg'] ) ) {
         return yourls__( 'Microsoft 365 login failed: your login attempt expired. Please try again.' );
     }
 
@@ -353,36 +440,39 @@ function yourls_m365_handle_callback() {
         return yourls__( 'Microsoft 365 login failed: no identity token received.' );
     }
 
-    $claims = yourls_m365_verify_id_token( $token_data['id_token'], $client_id, yourls_m365_issuer() );
+    $claims = yourls_m365_verify_id_token( $token_data['id_token'], $client_id, yourls_m365_issuer(), $stored['n'] );
     if( !$claims ) {
         return yourls__( 'Microsoft 365 login failed: identity token could not be verified.' );
     }
 
-    $email = strtolower( (string) ( $claims['preferred_username'] ?? $claims['email'] ?? '' ) );
-    if( !$email ) {
+    $username_claim = $claims['preferred_username'] ?? $claims['email'] ?? null;
+    $email = is_string( $username_claim ) ? strtolower( trim( $username_claim ) ) : '';
+    if( $email === '' ) {
         return yourls__( 'Microsoft 365 login failed: no email address in identity token.' );
     }
+    $email_log = json_encode( $email );
 
     $groups = array();
-    if( is_array( $claims['groups'] ?? null ) ) {
+    if( isset( $claims['_claim_names']['groups'] ) || !empty( $claims['hasgroups'] ) ) {
+        // Never trust a partial group list when Entra reports an overage.
+        yourls_debug_log( "Microsoft 365 login: group-membership overage for $email_log, group allow-list could not be evaluated" );
+    } elseif( is_array( $claims['groups'] ?? null ) ) {
         $groups = $claims['groups'];
-    } elseif( isset( $claims['_claim_names']['groups'] ) ) {
-        // "Overage" -- the account belongs to too many groups for Microsoft to list them all in
-        // the token, so group membership can't be evaluated for this sign-in. See the settings
-        // page for details.
-        yourls_debug_log( "Microsoft 365 login: group-membership overage for $email, group allow-list could not be evaluated" );
     }
 
     if( !yourls_m365_is_allowed( $email, $groups ) ) {
-        yourls_debug_log( "Microsoft 365 login: rejected account not on allow-list: $email" );
+        yourls_debug_log( "Microsoft 365 login: rejected account not on allow-list: $email_log" );
         return yourls__( 'Microsoft 365 login failed: this account is not authorized for this site.' );
     }
 
-    yourls_m365_set_signed_cookie( YOURLS_M365_SESSION_COOKIE, array(
+    if( !yourls_m365_set_signed_cookie( YOURLS_M365_SESSION_COOKIE, array(
         'email'  => $email,
         'groups' => $groups,
+        'cfg'    => yourls_m365_config_fingerprint(),
         'exp'    => time() + yourls_get_cookie_life(),
-    ), yourls_get_cookie_life() );
+    ), yourls_get_cookie_life() ) ) {
+        return yourls__( 'Microsoft 365 login failed: could not create a secure session.' );
+    }
 
     yourls_set_user( $email );
     yourls_do_action( 'login' );
@@ -398,12 +488,13 @@ function yourls_m365_on_logout() {
 
 /*
  * Login screen: add a "Sign in with Microsoft 365" button above the username/password form,
- * only shown once tenant + client id are configured.
+ * only shown when the SSO configuration is usable.
  */
 
 yourls_add_action( 'login_form_top', 'yourls_m365_login_button' );
 function yourls_m365_login_button() {
-    if( !yourls_m365_get_setting( 'client_id' ) || !yourls_m365_get_setting( 'tenant_id' ) ) {
+    if( !yourls_m365_secure_site() || !yourls_m365_get_setting( 'client_id' ) || !yourls_m365_get_setting( 'tenant_id' )
+        || !yourls_m365_get_setting( 'client_secret' ) || yourls_m365_cookie_secret() === false ) {
         return;
     }
 
@@ -461,6 +552,7 @@ function yourls_m365_maybe_save_settings() {
 
     // Config changed: drop any cached signing keys so a tenant switch takes effect immediately
     yourls_delete_option( 'm365_jwks_cache' );
+    yourls_delete_option( 'm365_issuer_cache' );
 
     yourls_add_notice( yourls__( 'Microsoft 365 login settings saved.' ) );
 }
@@ -476,6 +568,15 @@ function yourls_m365_settings_page() {
     <h2><?php yourls_e( 'Microsoft 365 Login' ); ?></h2>
 
     <p><?php yourls_e( 'Lets people sign in to this admin area with their Microsoft 365 / Entra ID account. Local username/password logins configured in config.php keep working as a fallback.' ); ?></p>
+    <?php if( yourls_m365_cookie_secret() === false ): ?>
+        <p><strong><?php yourls_e( 'SSO is unavailable: set YOURLS_COOKIEKEY in config.php to a unique random value of at least 32 characters.' ); ?></strong></p>
+    <?php endif; ?>
+    <?php if( !yourls_m365_secure_site() ): ?>
+        <p><strong><?php yourls_e( 'SSO is unavailable: configure YOURLS_SITE with an HTTPS URL.' ); ?></strong></p>
+    <?php endif; ?>
+    <?php if( !yourls_is_private() ): ?>
+        <p><strong><?php yourls_e( 'Authentication is not enforced: set YOURLS_PRIVATE to true in config.php.' ); ?></strong></p>
+    <?php endif; ?>
 
     <h3><?php yourls_e( '1. Azure app registration' ); ?></h3>
     <p><?php yourls_e( 'In the Azure Portal, register an application under Entra ID &rarr; App registrations, then add a <strong>Web</strong> platform redirect URI set to exactly:' ); ?></p>
@@ -531,7 +632,7 @@ function yourls_m365_settings_page() {
                     <p><em>
                         <?php yourls_e( 'Group <strong>Object ID</strong> (a GUID), not the group name -- find it under Entra ID &rarr; Groups &rarr; (your group) &rarr; Overview. Comma-separated for more than one group.' ); ?>
                         <?php yourls_e( 'Requires enabling group claims once for this app: Entra ID &rarr; App registrations &rarr; your app &rarr; <strong>Token configuration</strong> &rarr; Add groups claim &rarr; check "Security groups" for the ID token.' ); ?>
-                        <?php yourls_e( 'Note: Microsoft omits the groups claim if an account belongs to too many groups (~200+, tenant-wide); use a small dedicated group rather than a huge one.' ); ?>
+                        <?php yourls_e( 'Note: Microsoft omits the groups claim if an account belongs to too many groups (~200+, tenant-wide). The limit is based on the account, not the size of this group. Configure Entra to emit only groups assigned to this app if needed.' ); ?>
                     </em></p>
                 </td>
             </tr>
